@@ -10,10 +10,12 @@ class UserRole(str, enum.Enum):
 
 
 class ModelStatus(str, enum.Enum):
-    """Lifecycle status for a model version."""
+    """Lifecycle status for a model version state machine."""
 
-    DRAFT = "DRAFT"
+    REGISTERED = "REGISTERED"
+    VALIDATING = "VALIDATING"
     STAGING = "STAGING"
+    FAILED = "FAILED"
     ACTIVE = "ACTIVE"
     RETIRED = "RETIRED"
 

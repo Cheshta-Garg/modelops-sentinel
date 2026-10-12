@@ -95,7 +95,7 @@ class ModelVersion(Base, TimestampMixin):
     )
     status: Mapped[ModelStatus] = mapped_column(
         Enum(ModelStatus, native_enum=False),
-        default=ModelStatus.DRAFT,
+        default=ModelStatus.REGISTERED,
         nullable=False,
         index=True,
     )

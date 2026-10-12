@@ -1,17 +1,10 @@
 import uuid
-from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 
 import pytest
-import pytest_asyncio
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
-)
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from app.db.base import Base
 from app.models.deployment import Deployment
@@ -33,33 +26,6 @@ from app.models.metrics import (
 from app.models.model import Model, ModelVersion
 from app.models.monitoring import AuditLog, DriftEvent
 from app.models.user import User
-
-# In-memory async SQLite database for isolation testing
-TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
-
-
-@pytest_asyncio.fixture
-async def test_engine() -> AsyncGenerator[AsyncEngine, None]:
-    """Provide an isolated in-memory async SQLite engine with all tables created."""
-    engine = create_async_engine(TEST_DATABASE_URL, echo=False)
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield engine
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-    await engine.dispose()
-
-
-@pytest_asyncio.fixture
-async def db_session(test_engine: AsyncEngine) -> AsyncGenerator[AsyncSession, None]:
-    """Provide an async session scoped per test."""
-    session_factory = async_sessionmaker(
-        bind=test_engine,
-        class_=AsyncSession,
-        expire_on_commit=False,
-    )
-    async with session_factory() as session:
-        yield session
 
 
 @pytest.mark.asyncio
@@ -147,7 +113,7 @@ async def test_model_version_unique_tag_constraint(db_session: AsyncSession) -> 
     v1 = ModelVersion(
         model_id=model.id,
         version_tag="v1.0.0",
-        status=ModelStatus.DRAFT,
+        status=ModelStatus.REGISTERED,
         artifact_path="/artifacts/churn/v1/model.joblib",
         artifact_format=ArtifactFormat.JOBLIB,
         artifact_hash_sha256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -427,7 +393,7 @@ async def test_cascade_delete_model_removes_children(db_session: AsyncSession) -
     version = ModelVersion(
         model_id=model.id,
         version_tag="v1.0.0",
-        status=ModelStatus.DRAFT,
+        status=ModelStatus.REGISTERED,
         artifact_path="/temp.joblib",
         artifact_format=ArtifactFormat.JOBLIB,
         artifact_hash_sha256="hash",

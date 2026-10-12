@@ -6,6 +6,21 @@ ModelOps Sentinel is an engineering-first, production-oriented Machine Learning 
 
 ---
 
+## Project Philosophy & Scope
+
+**ModelOps Sentinel is not intended to replace MLflow, BentoML, Seldon, or enterprise MLOps platforms.**
+
+Instead, it is a **lightweight, educational ModelOps platform built from first principles** to deeply understand, implement, and demonstrate the foundational software engineering mechanisms of the production ML lifecycle:
+- How models and artifacts are versioned with transactional relational integrity.
+- How sub-millisecond inference caching operates via Redis without compute waste.
+- How background worker queues decouple CPU-heavy batch workloads from async web APIs.
+- How statistical drift (PSI and KS-tests) is detected out-of-band on streaming inference windows.
+- How canary traffic splitting and automated rollback health gates function under the hood.
+
+Every component is deliberately built to be **clean, simple, and 100% interview-defensible**, demonstrating core systems engineering rather than bloated feature parity.
+
+---
+
 ## Architectural Principles
 
 1. **Modular Asynchronous Monolith**: Single codebase, two processes (`API` and `Worker`), single Docker image. Zero unnecessary microservice overhead.
