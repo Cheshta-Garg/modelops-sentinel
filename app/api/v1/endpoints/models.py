@@ -4,9 +4,12 @@ import uuid
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth import require_roles
 from app.core.errors import AppException
 from app.db.session import get_db_session
-from app.models.enums import ArtifactFormat
+from app.models.enums import ArtifactFormat, UserRole
+from app.models.user import User
+from app.schemas.inference import InferenceRequestPayload, InferenceResponse
 from app.schemas.model import (
     ModelCreateRequest,
     ModelDetailResponse,
@@ -14,6 +17,8 @@ from app.schemas.model import (
     ModelVersionResponse,
     ModelVersionSummaryResponse,
 )
+from app.services.audit import AuditService
+from app.services.inference import inference_engine
 from app.services.registry import ModelRegistryService
 
 router = APIRouter(prefix="/models", tags=["Model Registry"])
@@ -25,13 +30,28 @@ registry_service = ModelRegistryService()
     response_model=ModelResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Register a new logical ML model",
-    description="Registers a new model identity in the registry with name, description, and task type.",
+    description="Registers a new model identity. Requires ENGINEER or ADMIN role.",
 )
 async def create_model(
     payload: ModelCreateRequest,
+    current_user: User = Depends(require_roles(UserRole.ENGINEER, UserRole.ADMIN)),
     session: AsyncSession = Depends(get_db_session),
 ) -> ModelResponse:
-    model = await registry_service.create_model(session, payload)
+    model = await registry_service.create_model(
+        session=session,
+        data=payload,
+        created_by_id=current_user.id,
+    )
+
+    await AuditService.log_action(
+        session=session,
+        action="MODEL_CREATED",
+        entity_type="MODEL",
+        entity_id=model.id,
+        user_id=current_user.id,
+        payload_after={"name": model.name, "task_type": model.task_type},
+    )
+
     return ModelResponse(
         id=model.id,
         name=model.name,
@@ -48,11 +68,12 @@ async def create_model(
     response_model=list[ModelResponse],
     status_code=status.HTTP_200_OK,
     summary="List all registered models",
-    description="Returns a paginated list of all models registered in the catalog.",
+    description="Returns a paginated list of all models. Requires VIEWER, ENGINEER, or ADMIN role.",
 )
 async def list_models(
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=100),
+    current_user: User = Depends(require_roles(UserRole.VIEWER, UserRole.ENGINEER, UserRole.ADMIN)),
     session: AsyncSession = Depends(get_db_session),
 ) -> list[ModelResponse]:
     model_records = await registry_service.list_models(session, skip=skip, limit=limit)
@@ -75,10 +96,11 @@ async def list_models(
     response_model=ModelDetailResponse,
     status_code=status.HTTP_200_OK,
     summary="Get model details and versions",
-    description="Fetches a specific model by UUID including all of its version iterations.",
+    description="Fetches a specific model by UUID. Requires VIEWER, ENGINEER, or ADMIN role.",
 )
 async def get_model(
     model_id: uuid.UUID,
+    current_user: User = Depends(require_roles(UserRole.VIEWER, UserRole.ENGINEER, UserRole.ADMIN)),
     session: AsyncSession = Depends(get_db_session),
 ) -> ModelDetailResponse:
     model = await registry_service.get_model(session, model_id)
@@ -109,10 +131,7 @@ async def get_model(
     response_model=ModelVersionResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Upload and validate a new model artifact version",
-    description=(
-        "Executes the full artifact pipeline: extension check, size check, SHA-256 calculation, "
-        "local storage, in-memory load testing, schema validation, and state transition to STAGING."
-    ),
+    description="Executes artifact pipeline. Requires ENGINEER or ADMIN role.",
 )
 async def create_model_version(
     model_id: uuid.UUID,
@@ -130,6 +149,7 @@ async def create_model_version(
         default=ArtifactFormat.JOBLIB,
         description="Format of the serialized model",
     ),
+    current_user: User = Depends(require_roles(UserRole.ENGINEER, UserRole.ADMIN)),
     session: AsyncSession = Depends(get_db_session),
 ) -> ModelVersionResponse:
     # Parse JSON schema strings
@@ -151,6 +171,20 @@ async def create_model_version(
         input_schema=parsed_input_schema,
         output_schema=parsed_output_schema,
         artifact_format=artifact_format,
+        created_by_id=current_user.id,
+    )
+
+    await AuditService.log_action(
+        session=session,
+        action="MODEL_VERSION_UPLOADED",
+        entity_type="MODEL_VERSION",
+        entity_id=version.id,
+        user_id=current_user.id,
+        payload_after={
+            "model_id": str(model_id),
+            "version_tag": version.version_tag,
+            "status": version.status.value,
+        },
     )
 
     return ModelVersionResponse(
@@ -165,4 +199,24 @@ async def create_model_version(
         output_schema=version.output_schema,
         created_at=version.created_at,
         updated_at=version.updated_at,
+    )
+
+
+@router.post(
+    "/{model_id}/predict",
+    response_model=InferenceResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Execute synchronous ML model inference",
+    description="Synchronous prediction with in-process & Redis caching. Requires authenticated user.",
+)
+async def predict_model(
+    model_id: uuid.UUID,
+    payload: InferenceRequestPayload,
+    current_user: User = Depends(require_roles(UserRole.VIEWER, UserRole.ENGINEER, UserRole.ADMIN)),
+    session: AsyncSession = Depends(get_db_session),
+) -> InferenceResponse:
+    return await inference_engine.predict(
+        session=session,
+        model_id=model_id,
+        payload=payload,
     )
