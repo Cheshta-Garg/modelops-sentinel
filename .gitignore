@@ -46,3 +46,5 @@ artifacts/
 *.onnx
 logs/
 *.log
+*.db
+*.sqlite

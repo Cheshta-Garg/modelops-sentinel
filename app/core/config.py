@@ -22,12 +22,16 @@ class Settings(BaseSettings):
     DEBUG: bool = Field(default=False)
     API_V1_PREFIX: str = Field(default="/api/v1")
     SECRET_KEY: str = Field(default="dev_secret_key_change_in_production")
+    JWT_ALGORITHM: str = Field(default="HS256")
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=1440)  # 24 hours
+
 
     # Server Binding
     HOST: str = Field(default="0.0.0.0")
     PORT: int = Field(default=8000)
 
-    # PostgreSQL Database
+    # Database Configuration (PostgreSQL by default, or SQLite override via DATABASE_URL)
+    DATABASE_URL: str | None = Field(default=None)
     POSTGRES_HOST: str = Field(default="localhost")
     POSTGRES_PORT: int = Field(default=5432)
     POSTGRES_DB: str = Field(default="modelops_db")
@@ -51,11 +55,14 @@ class Settings(BaseSettings):
 
     @property
     def async_database_url(self) -> str:
-        """Construct async PostgreSQL connection URL for asyncpg."""
+        """Construct async PostgreSQL connection URL for asyncpg, or return DATABASE_URL override."""
+        if self.DATABASE_URL:
+            return self.DATABASE_URL
         return (
             f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@"
             f"{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
         )
+
 
     @property
     def redis_url(self) -> str:

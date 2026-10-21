@@ -1,4 +1,5 @@
 from collections.abc import AsyncGenerator
+from typing import Any
 
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -11,14 +12,27 @@ from app.core.config import get_settings
 
 settings = get_settings()
 
-# Create SQLAlchemy 2.0 AsyncEngine with connection pool parameters
+# Determine dialect kwargs
+
+db_url = settings.async_database_url
+engine_kwargs: dict[str, Any] = {"echo": settings.DEBUG}
+if "sqlite" in db_url:
+    engine_kwargs["connect_args"] = {"check_same_thread": False}
+else:
+    engine_kwargs.update(
+        {
+            "pool_size": settings.POSTGRES_POOL_SIZE,
+            "max_overflow": settings.POSTGRES_MAX_OVERFLOW,
+            "pool_pre_ping": True,
+        }
+    )
+
+# Create SQLAlchemy 2.0 AsyncEngine
 async_engine: AsyncEngine = create_async_engine(
-    settings.async_database_url,
-    pool_size=settings.POSTGRES_POOL_SIZE,
-    max_overflow=settings.POSTGRES_MAX_OVERFLOW,
-    pool_pre_ping=True,
-    echo=settings.DEBUG,
+    db_url,
+    **engine_kwargs,
 )
+
 
 # Async session factory
 AsyncSessionLocal: async_sessionmaker[AsyncSession] = async_sessionmaker(

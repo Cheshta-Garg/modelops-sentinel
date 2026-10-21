@@ -21,8 +21,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info(
         f"Starting {settings.PROJECT_NAME} v{settings.VERSION} [{settings.ENVIRONMENT.upper()}]"
     )
+    if "sqlite" in settings.async_database_url:
+        from app.db.base import Base
+        from app.db.session import async_engine
+
+        async with async_engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        logger.info("Auto-initialized SQLite database tables.")
     yield
     logger.info(f"Shutting down {settings.PROJECT_NAME} gracefully.")
+
 
 
 def create_application() -> FastAPI:

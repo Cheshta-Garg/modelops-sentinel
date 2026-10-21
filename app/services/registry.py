@@ -36,6 +36,7 @@ class ModelRegistryService:
         self,
         session: AsyncSession,
         data: ModelCreateRequest,
+        created_by_id: uuid.UUID | None = None,
     ) -> Model:
         """Register a new logical model identity."""
         # 1. Enforce unique model name
@@ -52,6 +53,7 @@ class ModelRegistryService:
             name=data.name,
             description=data.description,
             task_type=data.task_type,
+            created_by_id=created_by_id,
         )
         session.add(model)
         await session.commit()
@@ -107,6 +109,7 @@ class ModelRegistryService:
         input_schema: dict[str, Any],
         output_schema: dict[str, Any],
         artifact_format: ArtifactFormat = ArtifactFormat.JOBLIB,
+        created_by_id: uuid.UUID | None = None,
     ) -> ModelVersion:
         """Execute the complete artifact ingestion, validation, and staging pipeline."""
         # 1. Verify parent model exists
@@ -180,6 +183,7 @@ class ModelRegistryService:
             artifact_hash_sha256=sha256_hash,
             input_schema=input_schema,
             output_schema=output_schema,
+            created_by_id=created_by_id,
         )
         session.add(version)
         await session.flush()

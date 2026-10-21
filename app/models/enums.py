@@ -4,9 +4,20 @@ import enum
 class UserRole(str, enum.Enum):
     """RBAC User Roles."""
 
-    ADMIN = "ADMIN"
-    OPERATOR = "OPERATOR"
-    VIEWER = "VIEWER"
+    ADMIN = "admin"
+    ENGINEER = "engineer"
+    VIEWER = "viewer"
+    OPERATOR = "operator"
+
+    @classmethod
+    def _missing_(cls, value: object) -> enum.Enum | None:
+        if isinstance(value, str):
+            val_lower = value.lower()
+            for member in cls:
+                if member.value == val_lower or member.name.lower() == val_lower:
+                    return member
+        return None
+
 
 
 class ModelStatus(str, enum.Enum):
