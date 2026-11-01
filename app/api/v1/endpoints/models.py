@@ -1,15 +1,19 @@
 import json
 import uuid
+from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import require_roles
-from app.core.errors import AppException
+from app.core.errors import AppException, NotFoundError
+from app.core.logging import request_id_ctx
 from app.db.session import get_db_session
-from app.models.enums import ArtifactFormat, UserRole
+from app.models.enums import ArtifactFormat, ModelStatus, UserRole
 from app.models.user import User
+from app.schemas.drift import ModelDriftResponse
 from app.schemas.inference import InferenceRequestPayload, InferenceResponse
+from app.schemas.job import AsyncJobResponse
 from app.schemas.model import (
     ModelCreateRequest,
     ModelDetailResponse,
@@ -18,7 +22,9 @@ from app.schemas.model import (
     ModelVersionSummaryResponse,
 )
 from app.services.audit import AuditService
+from app.services.drift import drift_service
 from app.services.inference import inference_engine
+from app.services.queue import queue_service
 from app.services.registry import ModelRegistryService
 
 router = APIRouter(prefix="/models", tags=["Model Registry"])
@@ -220,3 +226,134 @@ async def predict_model(
         model_id=model_id,
         payload=payload,
     )
+
+
+@router.post(
+    "/{model_id}/predict/async",
+    response_model=AsyncJobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Submit asynchronous ML model inference job",
+    description="Enqueues model prediction job for background worker processing. Returns 202 with job_id.",
+)
+async def predict_model_async(
+    model_id: uuid.UUID,
+    payload: InferenceRequestPayload,
+    current_user: User = Depends(require_roles(UserRole.VIEWER, UserRole.ENGINEER, UserRole.ADMIN)),
+    session: AsyncSession = Depends(get_db_session),
+) -> AsyncJobResponse:
+    # 1. Verify that model exists
+    model = await registry_service.get_model(session, model_id)
+
+    # 2. Verify that model has an eligible STAGING or ACTIVE version
+    if payload.version_tag:
+        target_version = next(
+            (v for v in model.versions if v.version_tag == payload.version_tag), None
+        )
+        if not target_version:
+            raise NotFoundError(
+                message=f"Version '{payload.version_tag}' not found for model '{model.name}'."
+            )
+    else:
+        eligible = [
+            v for v in model.versions if v.status in (ModelStatus.ACTIVE, ModelStatus.STAGING)
+        ]
+        if not eligible:
+            raise AppException(
+                message=f"Model '{model.name}' has no active or staging versions deployed for inference.",
+                code="NO_SERVICABLE_VERSION",
+                status_code=400,
+            )
+
+    req_id = request_id_ctx.get()
+    if req_id == "-":
+        req_id = uuid.uuid4().hex
+
+    # 3. Enqueue job for background worker execution
+    job_id = await queue_service.enqueue(
+        "async_predict_task",
+        model_id=str(model.id),
+        payload=payload.model_dump(),
+        request_id=req_id,
+        user_id=str(current_user.id),
+    )
+
+    return AsyncJobResponse(job_id=job_id)
+
+
+@router.get(
+    "/{id}/drift",
+    response_model=ModelDriftResponse,
+    summary="Get drift events and status for a model",
+    description="Retrieve statistical drift events and severity summary for a model. Accessible to VIEWER, ENGINEER, and ADMIN roles.",
+)
+async def get_model_drift(
+    id: uuid.UUID,
+    version_tag: str | None = Query(
+        None, description="Optional version tag (defaults to active/latest)"
+    ),
+    limit: int = Query(50, ge=1, le=500, description="Maximum drift events to return"),
+    current_user: User = Depends(require_roles(UserRole.VIEWER, UserRole.ENGINEER, UserRole.ADMIN)),
+    session: AsyncSession = Depends(get_db_session),
+) -> ModelDriftResponse:
+    report = await drift_service.get_drift_events_for_model(
+        session=session,
+        model_id=id,
+        version_tag=version_tag,
+        limit=limit,
+    )
+    return ModelDriftResponse(**report)
+
+
+@router.post(
+    "/{id}/drift/evaluate",
+    summary="Trigger immediate statistical drift evaluation",
+    description="Trigger drift evaluation for a model version. Requires ENGINEER or ADMIN role.",
+)
+async def trigger_model_drift_evaluation(
+    id: uuid.UUID,
+    version_tag: str | None = Query(None, description="Optional version tag"),
+    method: str = Query("PSI", description="Statistical test method: PSI or KS_TEST"),
+    window_size: int = Query(
+        100, ge=5, le=1000, description="Number of recent production inferences to evaluate"
+    ),
+    threshold: float | None = Query(None, description="Custom drift threshold override"),
+    current_user: User = Depends(require_roles(UserRole.ENGINEER, UserRole.ADMIN)),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    model = await registry_service.get_model(session, id)
+    target_version = None
+    if version_tag:
+        target_version = next((v for v in model.versions if v.version_tag == version_tag), None)
+        if not target_version:
+            raise NotFoundError(
+                message=f"Version '{version_tag}' not found for model '{model.name}'."
+            )
+    else:
+        eligible = [
+            v for v in model.versions if v.status in (ModelStatus.ACTIVE, ModelStatus.STAGING)
+        ]
+        if not eligible and model.versions:
+            target_version = sorted(model.versions, key=lambda v: v.created_at, reverse=True)[0]
+        elif eligible:
+            target_version = sorted(eligible, key=lambda v: v.created_at, reverse=True)[0]
+        else:
+            raise AppException(
+                message="Model has no registered versions.", code="NO_VERSIONS", status_code=400
+            )
+
+    events = await drift_service.evaluate_drift(
+        session=session,
+        model_version_id=target_version.id,
+        method=method,
+        window_size=window_size,
+        threshold=threshold,
+    )
+    return {
+        "model_id": str(model.id),
+        "model_name": model.name,
+        "version_tag": target_version.version_tag,
+        "method": method.upper(),
+        "evaluated_features_count": len(events),
+        "drifted_features_count": sum(1 for e in events if e.drift_detected),
+        "drift_detected": any(e.drift_detected for e in events),
+    }
