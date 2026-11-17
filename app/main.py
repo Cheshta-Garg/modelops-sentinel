@@ -2,12 +2,14 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST
 
 from app.api.v1.router import api_v1_router
 from app.core.config import get_settings
 from app.core.errors import register_error_handlers
 from app.core.logging import get_logger, setup_logging
+from app.core.metrics import get_latest_metrics
 from app.core.middleware import RequestContextMiddleware
 
 settings = get_settings()
@@ -30,7 +32,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.info("Auto-initialized SQLite database tables.")
     yield
     logger.info(f"Shutting down {settings.PROJECT_NAME} gracefully.")
-
 
 
 def create_application() -> FastAPI:
@@ -58,6 +59,15 @@ def create_application() -> FastAPI:
     @app.get("/", include_in_schema=False)
     async def root_redirect() -> RedirectResponse:
         return RedirectResponse(url="/docs")
+
+    # 5. Prometheus Metrics Scrape Endpoint
+    @app.get("/metrics", include_in_schema=False)
+    async def metrics_endpoint() -> Response:
+        """Expose collected Prometheus metrics for scraping."""
+        return Response(
+            content=get_latest_metrics(),
+            media_type=CONTENT_TYPE_LATEST,
+        )
 
     return app
 

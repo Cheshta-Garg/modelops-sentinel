@@ -1,0 +1,16 @@
+# Prometheus Configuration for ModelOps Sentinel
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+  scrape_timeout: 4s
+
+scrape_configs:
+  - job_name: "modelops-sentinel"
+    metrics_path: "/metrics"
+    static_configs:
+      - targets:
+          - "api:8000"
+          - "host.docker.internal:8000"
+        labels:
+          environment: "local"
+          service: "modelops-sentinel-api"
