@@ -29,12 +29,51 @@ class DriftEvent(Base):
         nullable=False,
         index=True,
     )
+    # Core Drift Event Attributes
+    feature: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
+        default=None,
+        index=True,
+    )
+    method: Mapped[str | None] = mapped_column(
+        String(50),
+        nullable=True,
+        default="PSI",
+        index=True,
+    )
+    score: Mapped[float | None] = mapped_column(
+        Float,
+        nullable=True,
+        default=0.0,
+    )
+    threshold: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        default=0.20,
+    )
+    severity: Mapped[str | None] = mapped_column(
+        String(20),
+        nullable=True,
+        default="NONE",
+        index=True,
+    )
+    detected_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        nullable=False,
+        index=True,
+    )
+
+    # Window & Context Attributes
     window_start: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
+        default=utc_now,
         nullable=False,
     )
     window_end: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
+        default=utc_now,
         nullable=False,
     )
     drift_detected: Mapped[bool] = mapped_column(
@@ -48,16 +87,14 @@ class DriftEvent(Base):
         default=DriftMetric.PSI,
         nullable=False,
     )
-    threshold: Mapped[float] = mapped_column(
-        Float,
-        nullable=False,
-    )
     overall_drift_score: Mapped[float] = mapped_column(
         Float,
+        default=0.0,
         nullable=False,
     )
     feature_drift_details: Mapped[dict[str, Any]] = mapped_column(
         JSONBCompat,
+        default=dict,
         nullable=False,
     )
     created_at: Mapped[datetime] = mapped_column(

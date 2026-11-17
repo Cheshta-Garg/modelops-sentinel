@@ -19,7 +19,6 @@ class UserRole(str, enum.Enum):
         return None
 
 
-
 class ModelStatus(str, enum.Enum):
     """Lifecycle status for a model version state machine."""
 

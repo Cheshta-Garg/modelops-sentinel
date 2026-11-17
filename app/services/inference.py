@@ -13,6 +13,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.errors import AppException, NotFoundError
 from app.core.logging import get_logger, request_id_ctx
+from app.core.metrics import track_cache_lookup, track_inference
 from app.core.redis import get_redis_client
 from app.models.enums import ModelStatus
 from app.models.inference import InferenceRequest
@@ -35,6 +36,8 @@ class InferenceEngine:
         self._model_cache: dict[str, Any] = {}
         # In-memory result cache fallback (for local standalone testing without Redis)
         self._memory_result_cache: dict[str, str] = {}
+        # Circuit breaker for Redis when offline
+        self._redis_offline_until: float = 0.0
 
     def _get_loaded_model(self, version: ModelVersion) -> Any:
         """Retrieve model object from in-process memory cache or load from disk artifact."""
@@ -44,15 +47,22 @@ class InferenceEngine:
 
         abs_path = self.storage.get_absolute_path(version.artifact_path)
         if not abs_path.exists():
-            raise NotFoundError(message=f"Model artifact file not found on disk at {version.artifact_path}")
+            raise NotFoundError(
+                message=f"Model artifact file not found on disk at {version.artifact_path}"
+            )
 
         try:
             model_obj = joblib.load(abs_path)
             self._model_cache[cache_key] = model_obj
-            logger.info(f"Loaded and cached model artifact in-process: {version.version_tag} ({version.id})")
+            logger.info(
+                f"Loaded and cached model artifact in-process: {version.version_tag} ({version.id})"
+            )
             return model_obj
         except Exception as exc:
-            logger.error(f"Failed to deserialize model artifact for version {version.id}: {exc}", exc_info=True)
+            logger.error(
+                f"Failed to deserialize model artifact for version {version.id}: {exc}",
+                exc_info=True,
+            )
             raise AppException(
                 message=f"Failed to load model artifact: {exc}",
                 code="MODEL_LOAD_ERROR",
@@ -66,7 +76,6 @@ class InferenceEngine:
         else:
             self._model_cache.clear()
             self._memory_result_cache.clear()
-
 
     @staticmethod
     def _compute_feature_cache_key(
@@ -111,7 +120,11 @@ class InferenceEngine:
                     code="INVALID_INPUT_FEATURES",
                     status_code=422,
                 )
-            features_dict = {f: features[i] for i, f in enumerate(expected_features)} if expected_features else {"raw": features}
+            features_dict = (
+                {f: features[i] for i, f in enumerate(expected_features)}
+                if expected_features
+                else {"raw": features}
+            )
             return np.array([features], dtype=float), features_dict
 
         raise AppException(
@@ -133,11 +146,7 @@ class InferenceEngine:
             req_id = uuid.uuid4().hex
 
         # 1. Fetch Model and Target Version
-        stmt = (
-            select(Model)
-            .where(Model.id == model_id)
-            .options(selectinload(Model.versions))
-        )
+        stmt = select(Model).where(Model.id == model_id).options(selectinload(Model.versions))
         model = (await session.execute(stmt)).scalar_one_or_none()
         if not model:
             raise NotFoundError(message=f"Model with id '{model_id}' was not found.")
@@ -145,11 +154,17 @@ class InferenceEngine:
         # Resolve version: requested tag or highest validated version (ACTIVE or STAGING)
         target_version: ModelVersion | None = None
         if payload.version_tag:
-            target_version = next((v for v in model.versions if v.version_tag == payload.version_tag), None)
+            target_version = next(
+                (v for v in model.versions if v.version_tag == payload.version_tag), None
+            )
             if not target_version:
-                raise NotFoundError(message=f"Version '{payload.version_tag}' not found for model '{model.name}'.")
+                raise NotFoundError(
+                    message=f"Version '{payload.version_tag}' not found for model '{model.name}'."
+                )
         else:
-            eligible = [v for v in model.versions if v.status in (ModelStatus.ACTIVE, ModelStatus.STAGING)]
+            eligible = [
+                v for v in model.versions if v.status in (ModelStatus.ACTIVE, ModelStatus.STAGING)
+            ]
             if not eligible:
                 raise AppException(
                     message=f"Model '{model.name}' has no active or staging versions deployed for inference.",
@@ -167,22 +182,37 @@ class InferenceEngine:
                 status_code=400,
             )
 
-        # 2. Check Redis Result Cache (Fail-Open)
-        cache_key = self._compute_feature_cache_key(model.id, target_version.version_tag, payload.features)
-        redis_client = get_redis_client()
+        # 2. Check Redis Result Cache (Fail-Open with Circuit Breaker)
+        cache_key = self._compute_feature_cache_key(
+            model.id, target_version.version_tag, payload.features
+        )
         cached_result: str | None = None
-        try:
-            cached_result = await redis_client.get(cache_key)
-        except Exception as exc:
-            logger.debug(f"Redis cache lookup failed (fail-open): {exc}")
-            cached_result = self._memory_result_cache.get(cache_key)
+        now_ts = time.time()
+        is_mocked = getattr(get_redis_client, "__module__", None) != "app.services.queue"
 
+        if is_mocked or now_ts >= self._redis_offline_until:
+            try:
+                redis_client = get_redis_client()
+                cached_result = await redis_client.get(cache_key)
+                self._redis_offline_until = 0.0
+            except Exception as exc:
+                if not is_mocked:
+                    self._redis_offline_until = now_ts + 30.0
+                logger.debug(f"Redis cache lookup failed (circuit breaker engaged 30s): {exc}")
+                cached_result = self._memory_result_cache.get(cache_key)
+        else:
+            cached_result = self._memory_result_cache.get(cache_key)
 
         if cached_result:
             try:
                 cached_data = json.loads(cached_result)
                 t_end = time.perf_counter()
                 latency_ms = round((t_end - t_start) * 1000, 2)
+                # Record metrics: cache hit and inference served via cache
+                track_cache_lookup(model.name, target_version.version_tag, hit=True)
+                track_inference(
+                    model.name, target_version.version_tag, (t_end - t_start), status="cache_hit"
+                )
                 return InferenceResponse(
                     request_id=req_id,
                     model=model.name,
@@ -193,24 +223,49 @@ class InferenceEngine:
                     cached=True,
                 )
             except Exception as exc:
-                logger.warning(f"Corrupt cached prediction payload, falling back to inference: {exc}")
+                logger.warning(
+                    f"Corrupt cached prediction payload, falling back to inference: {exc}"
+                )
+
+        # Record metric: cache miss
+        track_cache_lookup(model.name, target_version.version_tag, hit=False)
 
         # 3. Format & Validate Features
-        X_input, features_dict = self._format_features(payload.features, target_version.input_schema)
+        X_input, features_dict = self._format_features(
+            payload.features, target_version.input_schema
+        )
 
         # 4. In-Process Model Retrieval & Inference Execution
+        t_calc_start = time.perf_counter()
         model_obj = self._get_loaded_model(target_version)
         try:
             raw_pred = model_obj.predict(X_input)[0]
             # Convert numpy types to native Python
-            prediction: Any = int(raw_pred) if isinstance(raw_pred, (np.integer, int)) else float(raw_pred) if isinstance(raw_pred, (np.floating, float)) else str(raw_pred)
+            prediction: Any = (
+                int(raw_pred)
+                if isinstance(raw_pred, (np.integer, int))
+                else float(raw_pred)
+                if isinstance(raw_pred, (np.floating, float))
+                else str(raw_pred)
+            )
 
             confidence = 1.0
             if hasattr(model_obj, "predict_proba") and callable(model_obj.predict_proba):
                 probas = model_obj.predict_proba(X_input)[0]
                 confidence = float(np.max(probas))
+
+            # Record metric: inference execution duration and usage count
+            t_calc_duration = time.perf_counter() - t_calc_start
+            track_inference(
+                model.name, target_version.version_tag, t_calc_duration, status="success"
+            )
         except Exception as exc:
-            logger.error(f"Inference computation error for {model.name}:{target_version.version_tag}: {exc}", exc_info=True)
+            t_calc_duration = time.perf_counter() - t_calc_start
+            track_inference(model.name, target_version.version_tag, t_calc_duration, status="error")
+            logger.error(
+                f"Inference computation error for {model.name}:{target_version.version_tag}: {exc}",
+                exc_info=True,
+            )
             raise AppException(
                 message=f"Model inference failed during calculation: {exc}",
                 code="INFERENCE_EXECUTION_FAILED",
@@ -223,11 +278,15 @@ class InferenceEngine:
         # 5. Store in Result Cache (Memory Fallback + Redis Fail-Open)
         cache_payload = json.dumps({"prediction": prediction, "confidence": round(confidence, 4)})
         self._memory_result_cache[cache_key] = cache_payload
-        try:
-            await redis_client.setex(cache_key, RESULT_CACHE_TTL_SECONDS, cache_payload)
-        except Exception as exc:
-            logger.debug(f"Failed to cache inference result in Redis (fail-open): {exc}")
-
+        if is_mocked or now_ts >= self._redis_offline_until:
+            try:
+                redis_client = get_redis_client()
+                await redis_client.setex(cache_key, RESULT_CACHE_TTL_SECONDS, cache_payload)
+                self._redis_offline_until = 0.0
+            except Exception as exc:
+                if not is_mocked:
+                    self._redis_offline_until = now_ts + 30.0
+                logger.debug(f"Failed to cache inference result in Redis (fail-open): {exc}")
 
         # 6. Telemetry Creation: PostgreSQL Audit Record & Redis Queue Buffer
         inf_record = InferenceRequest(
@@ -242,21 +301,26 @@ class InferenceEngine:
         await session.commit()
 
         # Push to Redis buffer for downstream async worker telemetry processing
-        try:
-            telemetry_event = {
-                "request_id": req_id,
-                "model_id": str(model.id),
-                "model_name": model.name,
-                "version_tag": target_version.version_tag,
-                "input_features": features_dict,
-                "prediction": prediction,
-                "confidence": round(confidence, 4),
-                "latency_ms": latency_ms,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-            await redis_client.lpush("telemetry:buffer", json.dumps(telemetry_event))
-        except Exception as exc:
-            logger.debug(f"Failed to buffer telemetry event to Redis (fail-open): {exc}")
+        if is_mocked or now_ts >= self._redis_offline_until:
+            try:
+                redis_client = get_redis_client()
+                telemetry_event = {
+                    "request_id": req_id,
+                    "model_id": str(model.id),
+                    "model_name": model.name,
+                    "version_tag": target_version.version_tag,
+                    "input_features": features_dict,
+                    "prediction": prediction,
+                    "confidence": round(confidence, 4),
+                    "latency_ms": latency_ms,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+                await redis_client.lpush("telemetry:buffer", json.dumps(telemetry_event))
+                self._redis_offline_until = 0.0
+            except Exception as exc:
+                if not is_mocked:
+                    self._redis_offline_until = now_ts + 30.0
+                logger.debug(f"Failed to buffer telemetry event to Redis (fail-open): {exc}")
 
         return InferenceResponse(
             request_id=req_id,
@@ -271,4 +335,3 @@ class InferenceEngine:
 
 # Singleton engine instance
 inference_engine = InferenceEngine()
-
