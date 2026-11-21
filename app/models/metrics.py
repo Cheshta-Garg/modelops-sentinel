@@ -95,7 +95,7 @@ class ReferenceStats(Base):
 
 
 class OnlineMetrics(Base):
-    """Aggregated model prediction accuracy derived from ground-truth matches."""
+    """Real-time online serving metrics observed at inference time (separate from delayed ground truth)."""
 
     __tablename__ = "online_metrics"
     __table_args__ = (
@@ -151,7 +151,14 @@ class OnlineMetrics(Base):
 
 
 class PerfMetrics(Base):
-    """Operational latency, throughput, and error metrics across sliding windows."""
+    """Delayed ground-truth model performance metrics computed by background workers.
+
+    Architectural Separation:
+    - OfflineMetrics (offline_metrics): Pre-deployment validation/test-set benchmarks.
+    - Online Metrics (Prometheus /metrics + online_metrics): Immediate inference-time telemetry.
+    - PerfMetrics (perf_metrics): Delayed ground-truth predictive quality (accuracy, precision,
+      recall, F1, confusion matrix) computed only after real-world outcome labels arrive.
+    """
 
     __tablename__ = "perf_metrics"
 
@@ -168,20 +175,43 @@ class PerfMetrics(Base):
     )
     window_start: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
+        default=utc_now,
         nullable=False,
         index=True,
     )
     window_end: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
+        default=utc_now,
         nullable=False,
         index=True,
     )
-    total_requests: Mapped[int] = mapped_column(Integer, nullable=False)
-    cache_hits: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    p50_latency_ms: Mapped[float] = mapped_column(Float, nullable=False)
-    p95_latency_ms: Mapped[float] = mapped_column(Float, nullable=False)
-    p99_latency_ms: Mapped[float] = mapped_column(Float, nullable=False)
-    error_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    # Delayed Ground-Truth Performance Attributes (Stage 9)
+    sample_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    accuracy: Mapped[float | None] = mapped_column(Float, nullable=True)
+    precision: Mapped[float | None] = mapped_column(Float, nullable=True)
+    recall: Mapped[float | None] = mapped_column(Float, nullable=True)
+    f1_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    confusion_matrix: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONBCompat,
+        nullable=True,
+    )
+    evaluated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        nullable=False,
+        index=True,
+    )
+
+    # Legacy Stage 2 operational columns retained as nullable for schema backward-compatibility.
+    # Stage 9 delayed ground-truth evaluations NEVER populate these fields.
+    total_requests: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+    cache_hits: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+    p50_latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
+    p95_latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
+    p99_latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
+    error_count: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=utc_now,

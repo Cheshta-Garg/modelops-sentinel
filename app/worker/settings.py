@@ -4,7 +4,12 @@ from arq.connections import RedisSettings
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
-from app.worker.tasks import async_predict_task, process_telemetry_task
+from app.worker.tasks import (
+    async_predict_task,
+    evaluate_drift_task,
+    evaluate_ground_truth_task,
+    process_telemetry_task,
+)
 
 logger = get_logger(__name__)
 settings = get_settings()
@@ -29,7 +34,12 @@ class WorkerSettings:
         arq app.worker.settings.WorkerSettings
     """
 
-    functions = [async_predict_task, process_telemetry_task]
+    functions = [
+        async_predict_task,
+        process_telemetry_task,
+        evaluate_drift_task,
+        evaluate_ground_truth_task,
+    ]
     redis_settings = RedisSettings(
         host=settings.REDIS_HOST,
         port=settings.REDIS_PORT,

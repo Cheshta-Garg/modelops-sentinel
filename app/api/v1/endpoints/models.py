@@ -12,6 +12,11 @@ from app.db.session import get_db_session
 from app.models.enums import ArtifactFormat, ModelStatus, UserRole
 from app.models.user import User
 from app.schemas.drift import ModelDriftResponse
+from app.schemas.ground_truth import (
+    FeedbackCreateRequest,
+    FeedbackResponse,
+    ModelPerformanceResponse,
+)
 from app.schemas.inference import InferenceRequestPayload, InferenceResponse
 from app.schemas.job import AsyncJobResponse
 from app.schemas.model import (
@@ -23,6 +28,7 @@ from app.schemas.model import (
 )
 from app.services.audit import AuditService
 from app.services.drift import drift_service
+from app.services.ground_truth import ground_truth_service
 from app.services.inference import inference_engine
 from app.services.queue import queue_service
 from app.services.registry import ModelRegistryService
@@ -356,4 +362,151 @@ async def trigger_model_drift_evaluation(
         "evaluated_features_count": len(events),
         "drifted_features_count": sum(1 for e in events if e.drift_detected),
         "drift_detected": any(e.drift_detected for e in events),
+    }
+
+
+@router.post(
+    "/{id}/feedback",
+    response_model=FeedbackResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Submit delayed ground-truth feedback for a prior prediction",
+    description=(
+        "Matches a real-world ground-truth outcome label back to an earlier inference request "
+        "via request_id and stores it in ground_truth."
+    ),
+)
+async def submit_model_feedback(
+    id: uuid.UUID,
+    payload: FeedbackCreateRequest,
+    current_user: User = Depends(
+        require_roles(UserRole.VIEWER, UserRole.OPERATOR, UserRole.ENGINEER, UserRole.ADMIN)
+    ),
+    session: AsyncSession = Depends(get_db_session),
+) -> FeedbackResponse:
+    result = await ground_truth_service.record_feedback(
+        session=session,
+        model_id=id,
+        payload=payload,
+    )
+    return FeedbackResponse(**result)
+
+
+@router.get(
+    "/{id}/performance",
+    response_model=ModelPerformanceResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Get delayed ground-truth performance metrics for a model",
+    description=(
+        "Returns delayed ground-truth evaluation metrics (accuracy, precision, recall, F1, "
+        "confusion matrix) stored in perf_metrics, strictly separated from offline and online metrics."
+    ),
+)
+async def get_model_performance(
+    id: uuid.UUID,
+    version_tag: str | None = Query(
+        None, description="Optional version tag (defaults to active/latest)"
+    ),
+    limit: int = Query(50, ge=1, le=500, description="Maximum perf_metrics snapshots to return"),
+    current_user: User = Depends(
+        require_roles(UserRole.VIEWER, UserRole.OPERATOR, UserRole.ENGINEER, UserRole.ADMIN)
+    ),
+    session: AsyncSession = Depends(get_db_session),
+) -> ModelPerformanceResponse:
+    report = await ground_truth_service.get_model_performance(
+        session=session,
+        model_id=id,
+        version_tag=version_tag,
+        limit=limit,
+    )
+    return ModelPerformanceResponse(**report)
+
+
+@router.post(
+    "/{id}/performance/evaluate",
+    status_code=status.HTTP_200_OK,
+    summary="Trigger delayed ground-truth performance evaluation",
+    description=(
+        "Evaluates matched (inference_requests, ground_truth) pairs and stores results in "
+        "perf_metrics. Supports immediate execution or background worker enqueueing (async_mode=true)."
+    ),
+)
+async def trigger_model_performance_evaluation(
+    id: uuid.UUID,
+    version_tag: str | None = Query(None, description="Optional version tag"),
+    window_size: int = Query(
+        500, ge=1, le=10000, description="Maximum recent matched ground-truth samples to evaluate"
+    ),
+    async_mode: bool = Query(
+        False, description="When true, enqueue evaluation to background worker and return job_id"
+    ),
+    current_user: User = Depends(
+        require_roles(UserRole.OPERATOR, UserRole.ENGINEER, UserRole.ADMIN)
+    ),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    model = await registry_service.get_model(session, id)
+    target_version = None
+    if version_tag:
+        target_version = next((v for v in model.versions if v.version_tag == version_tag), None)
+        if not target_version:
+            raise NotFoundError(
+                message=f"Version '{version_tag}' not found for model '{model.name}'."
+            )
+    else:
+        eligible = [
+            v for v in model.versions if v.status in (ModelStatus.ACTIVE, ModelStatus.STAGING)
+        ]
+        if eligible:
+            target_version = sorted(eligible, key=lambda v: v.created_at, reverse=True)[0]
+        elif model.versions:
+            target_version = sorted(model.versions, key=lambda v: v.created_at, reverse=True)[0]
+        else:
+            raise AppException(
+                message="Model has no registered versions.", code="NO_VERSIONS", status_code=400
+            )
+
+    if async_mode:
+        job_id = await queue_service.enqueue(
+            "evaluate_ground_truth_task",
+            model_version_id=str(target_version.id),
+            window_size=window_size,
+        )
+        return {
+            "metric_category": "delayed_ground_truth_performance",
+            "model_id": str(model.id),
+            "model_name": model.name,
+            "version_tag": target_version.version_tag,
+            "job_id": job_id,
+            "status": "QUEUED",
+        }
+
+    perf_record = await ground_truth_service.evaluate_delayed_performance(
+        session=session,
+        model_version_id=target_version.id,
+        window_size=window_size,
+    )
+    if perf_record is None:
+        return {
+            "metric_category": "delayed_ground_truth_performance",
+            "model_id": str(model.id),
+            "model_name": model.name,
+            "version_tag": target_version.version_tag,
+            "sample_count": 0,
+            "status": "NO_GROUND_TRUTH",
+        }
+
+    return {
+        "metric_category": "delayed_ground_truth_performance",
+        "perf_metric_id": str(perf_record.id),
+        "model_id": str(model.id),
+        "model_name": model.name,
+        "version_tag": target_version.version_tag,
+        "sample_count": perf_record.sample_count,
+        "accuracy": perf_record.accuracy,
+        "precision": perf_record.precision,
+        "recall": perf_record.recall,
+        "f1_score": perf_record.f1_score,
+        "confusion_matrix": perf_record.confusion_matrix,
+        "evaluated_at": perf_record.evaluated_at.isoformat(),
+        "status": "COMPLETED",
     }

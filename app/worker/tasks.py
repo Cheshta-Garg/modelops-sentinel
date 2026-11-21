@@ -273,8 +273,81 @@ async def evaluate_drift_task(
         return result
 
 
+async def evaluate_ground_truth_task(
+    ctx: dict,
+    model_version_id: str,
+    window_size: int = 500,
+    since: str | None = None,
+    until: str | None = None,
+    positive_label: Any | None = None,
+) -> dict[str, Any]:
+    """Background worker task to compute delayed ground-truth performance and store in perf_metrics.
+
+    Calculates accuracy, precision, recall, F1, and confusion matrix from joined
+    (inference_requests, ground_truth) pairs and persists strictly to `perf_metrics`.
+    """
+    logger.info(
+        f"[Worker] Starting delayed ground-truth evaluation task for model_version '{model_version_id}'"
+    )
+    session_factory = ctx.get("session_factory") or AsyncSessionLocal
+    try:
+        version_uuid = uuid.UUID(str(model_version_id))
+    except ValueError as exc:
+        raise AppException(
+            message=f"Invalid model_version UUID format: '{model_version_id}'",
+            code="INVALID_UUID",
+            status_code=400,
+        ) from exc
+
+    since_dt = datetime.fromisoformat(since) if since else None
+    until_dt = datetime.fromisoformat(until) if until else None
+
+    async with session_factory() as session:
+        from app.services.ground_truth import ground_truth_service
+
+        perf_record = await ground_truth_service.evaluate_delayed_performance(
+            session=session,
+            model_version_id=version_uuid,
+            window_size=window_size,
+            since=since_dt,
+            until=until_dt,
+            positive_label=positive_label,
+        )
+
+        if perf_record is None:
+            return {
+                "model_version_id": str(model_version_id),
+                "metric_category": "delayed_ground_truth_performance",
+                "sample_count": 0,
+                "status": "NO_GROUND_TRUTH",
+                "evaluated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        result = {
+            "perf_metric_id": str(perf_record.id),
+            "model_version_id": str(model_version_id),
+            "metric_category": "delayed_ground_truth_performance",
+            "sample_count": perf_record.sample_count,
+            "accuracy": perf_record.accuracy,
+            "precision": perf_record.precision,
+            "recall": perf_record.recall,
+            "f1_score": perf_record.f1_score,
+            "confusion_matrix": perf_record.confusion_matrix,
+            "window_start": perf_record.window_start.isoformat(),
+            "window_end": perf_record.window_end.isoformat(),
+            "evaluated_at": perf_record.evaluated_at.isoformat(),
+            "status": "COMPLETED",
+        }
+        logger.info(
+            f"[Worker] Ground-truth evaluation finished for '{model_version_id}': "
+            f"n={perf_record.sample_count}, accuracy={perf_record.accuracy}, f1={perf_record.f1_score}"
+        )
+        return result
+
+
 TASK_REGISTRY = {
     "async_predict_task": async_predict_task,
     "process_telemetry_task": process_telemetry_task,
     "evaluate_drift_task": evaluate_drift_task,
+    "evaluate_ground_truth_task": evaluate_ground_truth_task,
 }
